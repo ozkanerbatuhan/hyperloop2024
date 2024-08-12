@@ -24,12 +24,14 @@ class MotionCalculator {
       return this.getCurrentState();
     }
 
+    // ... (keep existing angle calculations)
     // Convert acceleration to g force (assuming it's in m/s^2)
     const accInG = {
       x: acceleration.x / this.gravity,
       y: acceleration.y / this.gravity,
       z: acceleration.z / this.gravity,
     };
+    
 
     // Calculate accelerometer angles
     const accAngleX =
@@ -102,7 +104,88 @@ class MotionCalculator {
     this.lastUpdateTime = currentTime;
     this.lastGyro = gyro;
 
+    const initialState = {
+      position: { ...this.position },
+      velocity: { ...this.velocity },
+    };
+
+    const finalState = this.rk4(initialState, acceleration, elapsedTime);
+
+    this.position = finalState.position;
+    this.velocity = finalState.velocity;
+
+    this.lastUpdateTime = currentTime;
+    this.lastGyro = gyro;
+
     return this.getCurrentState(elapsedTime);
+  }
+
+  rk4(initialState, acceleration, dt) {
+    const k1 = this.derivative(initialState, acceleration);
+    const k2 = this.derivative(
+      this.getMiddleState(initialState, k1, dt / 2),
+      acceleration
+    );
+    const k3 = this.derivative(
+      this.getMiddleState(initialState, k2, dt / 2),
+      acceleration
+    );
+    const k4 = this.derivative(
+      this.getMiddleState(initialState, k3, dt),
+      acceleration
+    );
+
+    return {
+      position: {
+        x:
+          initialState.position.x +
+          (dt / 6) * (k1.dx + 2 * k2.dx + 2 * k3.dx + k4.dx),
+        y:
+          initialState.position.y +
+          (dt / 6) * (k1.dy + 2 * k2.dy + 2 * k3.dy + k4.dy),
+        z:
+          initialState.position.z +
+          (dt / 6) * (k1.dz + 2 * k2.dz + 2 * k3.dz + k4.dz),
+      },
+      velocity: {
+        x:
+          initialState.velocity.x +
+          (dt / 6) * (k1.dvx + 2 * k2.dvx + 2 * k3.dvx + k4.dvx),
+        y:
+          initialState.velocity.y +
+          (dt / 6) * (k1.dvy + 2 * k2.dvy + 2 * k3.dvy + k4.dvy),
+        z:
+          initialState.velocity.z +
+          (dt / 6) * (k1.dvz + 2 * k2.dvz + 2 * k3.dvz + k4.dvz),
+      },
+    };
+  }
+
+  derivative(state, acceleration) {
+    const filteredAcc = this.lowPassFilter(this.removeGravity(acceleration));
+    return {
+      dx: state.velocity.x,
+      dy: state.velocity.y,
+      dz: state.velocity.z,
+      dvx: filteredAcc.x,
+      dvy: filteredAcc.y,
+      dvz: filteredAcc.z,
+    };
+  }
+
+  getMiddleState(initialState, k, dt) {
+    return {
+      position: {
+        x: initialState.position.x + k.dx * dt,
+        y: initialState.position.y + k.dy * dt,
+        z: initialState.position.z + k.dz * dt,
+      },
+      velocity: {
+        x: initialState.velocity.x + k.dvx * dt,
+        y: initialState.velocity.y + k.dvy * dt,
+        z: initialState.velocity.z + k.dvz * dt,
+      },
+    };
   }
 
   initializeStationary(acceleration, gyro) {

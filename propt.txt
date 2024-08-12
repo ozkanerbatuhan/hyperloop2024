@@ -1,0 +1,114 @@
+bu result dosyasında gyro ve ivme verisi gelen bir sensörden alınan dataları göndereceğim clas tan cıkan bir result objeleriyle dolu. Sorun şu gelen veriler ivme verileri ve sensör asla hareket etmiyor ama yine de cok fazla hız ve posisyon değişimi oluyor bunu çözebiliri misin 
+kod: 
+class MotionCalculator {
+  constructor() {
+    this.velocity = { x: 0, y: 0, z: 0 };
+    this.position = { x: 0, y: 0, z: 0 };
+    this.orientation = { pitch: 0, yaw: 0, roll: 0 };
+    this.lastUpdateTime = Date.now();
+    this.gravity = 9.81;
+    this.alpha = 0.95; // Alçak geçirgen filtre katsayısı (arttırıldı)
+    this.gyroError = { x: 0, y: 0, z: 0 };
+    this.lastGyro = { x: 0, y: 0, z: 0 };
+  }
+
+  update(acceleration, gyro) {
+    const currentTime = Date.now();
+    const timeStep = (currentTime - this.lastUpdateTime) / 1000; // Saniye cinsinden
+
+    // Yerçekimi etkisini çıkar ve geliştirilmiş alçak geçirgen filtre uygula
+    const filteredAcc = this.lowPassFilter(this.removeGravity(acceleration));
+
+    // Hız güncelleme
+    this.velocity.x += filteredAcc.x * timeStep;
+    this.velocity.y += filteredAcc.y * timeStep;
+    this.velocity.z += filteredAcc.z * timeStep;
+
+    // Geliştirilmiş sönümleme
+    const dampingFactor = 0.98;
+    this.velocity.x *= dampingFactor;
+    this.velocity.y *= dampingFactor;
+    this.velocity.z *= dampingFactor;
+
+    // Konum güncelleme
+    this.position.x += this.velocity.x * timeStep;
+    this.position.y += this.velocity.y * timeStep;
+    this.position.z += this.velocity.z * timeStep;
+
+    // İyileştirilmiş gyro verisi ve yönelim güncelleme
+    const correctedGyro = this.correctGyro(gyro);
+    this.updateOrientation(acceleration, correctedGyro, timeStep);
+
+    this.lastUpdateTime = currentTime;
+    this.lastGyro = gyro;
+
+    return this.getCurrentState();
+  }
+
+  removeGravity(acceleration) {
+    return {
+      x: acceleration.x,
+      y: acceleration.y - this.gravity,
+      z: acceleration.z 
+    };
+  }
+
+  lowPassFilter(acceleration) {
+    this.filteredAcc = this.filteredAcc || { x: 0, y: 0, z: 0 };
+    this.filteredAcc.x = this.alpha * this.filteredAcc.x + (1 - this.alpha) * acceleration.x;
+    this.filteredAcc.y = this.alpha * this.filteredAcc.y + (1 - this.alpha) * acceleration.y;
+    this.filteredAcc.z = this.alpha * this.filteredAcc.z + (1 - this.alpha) * acceleration.z;
+    return this.filteredAcc;
+  }
+
+  correctGyro(gyro) {
+    const gyroDiff = {
+      x: gyro.x - this.lastGyro.x,
+      y: gyro.y - this.lastGyro.y,
+      z: gyro.z - this.lastGyro.z
+    };
+
+    const errorWeight = 0.98;
+    this.gyroError.x = errorWeight * this.gyroError.x + (1 - errorWeight) * gyroDiff.x;
+    this.gyroError.y = errorWeight * this.gyroError.y + (1 - errorWeight) * gyroDiff.y;
+    this.gyroError.z = errorWeight * this.gyroError.z + (1 - errorWeight) * gyroDiff.z;
+
+    return {
+      x: gyro.x - this.gyroError.x,
+      y: gyro.y - this.gyroError.y,
+      z: gyro.z - this.gyroError.z
+    };
+  }
+
+  updateOrientation(acceleration, gyro, timeStep) {
+    // Geliştirilmiş complementary filtre kullanarak yönelim güncelleme
+    const accelPitch = Math.atan2(-acceleration.x, Math.sqrt(acceleration.y * acceleration.y + acceleration.z * acceleration.z));
+    const accelRoll = Math.atan2(acceleration.y, acceleration.z);
+
+    const gyroWeight = 0.96; // Gyro ağırlığı arttırıldı
+    this.orientation.pitch = gyroWeight * (this.orientation.pitch + gyro.x * timeStep) + (1 - gyroWeight) * accelPitch;
+    this.orientation.roll = gyroWeight * (this.orientation.roll + gyro.y * timeStep) + (1 - gyroWeight) * accelRoll;
+    this.orientation.yaw += gyro.z * timeStep;
+
+    // Açıları derece cinsine çevir ve normalize et
+    this.orientation.pitch = this.normalizeAngle(this.orientation.pitch * 180 / Math.PI);
+    this.orientation.roll = this.normalizeAngle(this.orientation.roll * 180 / Math.PI);
+    this.orientation.yaw = this.normalizeAngle(this.orientation.yaw * 180 / Math.PI);
+  }
+
+  normalizeAngle(angle) {
+    while (angle > 180) angle -= 360;
+    while (angle < -180) angle += 360;
+    return angle;
+  }
+
+  getCurrentState() {
+    return {
+      velocity: { ...this.velocity },
+      position: { ...this.position },
+      orientation: { ...this.orientation }
+    };
+  }
+}
+
+module.exports = MotionCalculator;

@@ -1,31 +1,47 @@
 const express = require("express");
 const http = require("http");
 const socketIO = require("socket.io");
-const MotionCalculator = require("./class");
-
+const MotionCalculator = require("./gptdeeneme.js");
+const fs = require("fs");
+const path = require("path");
+const RaceTrack = require("./bandClass.js");
+const isRedColor = require("./isRed.js");
 let dashboardID = 1;
 let trainID = 2;
 let mobileID = 3;
 
 const app = express();
 const server = http.createServer(app);
-
+const raceTrack = new RaceTrack();
 const io = socketIO(server, {
   cors: {
     origin: "*",
   },
 });
-
-// Her tren için ayrı bir hesaplayıcı oluştur
+const maxStrength = 12000;
+const minStrength = 5;
+const strengthThreshold = 1000; // Example threshold for acceptable strength
+let temperatures = {
+  tempAmbient: 0,
+  tempBattery: 0,
+};
+let passedBandCount = 0;
+let passedBandCountCoolDown;
+let motionUpdate = {
+  acceleration: { x: 0, y: 0, z: 0 },
+  velocity: { x: 0, y: 0, z: 0 },
+  position: { x: 0, y: 0, z: 0 },
+  orientation: { roll: 0, pitch: 0, yaw: 0 },
+  timeInterval: 0,
+};
 const calculators = new Map();
 
 io.on("connection", (socket) => {
-  console.log("A user connected", socket.id);
   socket.emit("connected", socket.id);
-
   socket.on("train", (id) => {
     console.log("train", id);
     trainID = id;
+    socket.to(trainID).emit("ping", 1);
     if (!calculators.has(id)) {
       calculators.set(id, new MotionCalculator());
     }
@@ -41,31 +57,73 @@ io.on("connection", (socket) => {
     mobileID = id;
   });
 
-  // come to train and send to dashboard
-  socket.on("hasBand", (isReady) => {
-    console.log("ready", isReady);
-    socket.to(dashboardID).emit("ready", isReady);
+  socket.on("band", (colorData) => {
+    const isRed = isRedColor(colorData);
+    console.log("isRed", isRed, passedBandCountCoolDown);
+    if (isRed && Date.now() - passedBandCountCoolDown > 500) {
+      passedBandCount += 1;
+      passedBandCountCoolDown = Date.now();
+      const { position, speed, timeStep } = raceTrack.calculatePositionAndSpeed(
+        Date.now()
+      );
+      socket
+        .to(dashboardID)
+        .emit("position", { passedBandCount, position, timeStep });
+      socket
+        .to(mobileID)
+        .emit("position", { passedBandCount, position, timeStep });
+      socket.to(dashboardID).emit("speedUpdate", { speed, timeStep });
+      socket.to(mobileID).emit("speedUpdate", { speed, timeStep });
+    }
   });
-
+  socket.on("lidar", (data) => {
+    temperatures.tempAmbient = data.temp;
+    socket.to(dashboardID).emit("temperatureUpdate", temperatures);
+    if (strength >= strengthThreshold) {
+      const remainingDistance =
+        ((strength - minStrength) / (maxStrength - minStrength)) * 30;
+      if (remainingDistance <= 30) {
+        socket.to(mobileID).emit("lidar", { dis, strength, temp, time });
+        socket.to(dashboardID).emit("lidar", { dis, strength, temp, time });
+      }
+    }
+  });
+  socket.on("ping", (time) => {
+    console.log("ping", Date.now() - time);
+    socket.to(dashboardID).emit("ping", Date.now() - time);
+    socket.to(mobileID).emit("ping", Date.now() - time);
+    socket.to(trainID).emit("ping", Date.now());
+  });
   socket.on("acceleration", (acc) => {
     if (calculators.has(trainID)) {
       const json = JSON.parse(acc);
       const accelerometer = json.accelerometer;
       const gyroscope = json.gyroscope;
       const temperature = json.temperature;
-      console.log("temperature", temperature);
-
+      temperatures.tempBattery = temperature;
+      socket.to(dashboardID).emit("temperatureUpdate", temperatures);
       const calculator = calculators.get(trainID);
       const result = calculator.update(accelerometer, gyroscope);
-      console.log("result", result);
-
-      // Hesaplanan değerleri dashboard'a gönder
+      socket
+        .to(dashboardID)
+        .emit("progressUpdate", (result.position.x / 191) * 100);
       socket.to(dashboardID).emit("motionUpdate", {
-        acceleration: acc,
+        acceleration: accelerometer,
         velocity: result?.velocity || { x: 0, y: 0, z: 0 },
         position: result?.position || { x: 0, y: 0, z: 0 },
         orientation: result?.orientation || { roll: 0, pitch: 0, yaw: 0 },
-        timeStep: result?.timeStep || 0,
+      });
+      //console.log(result);
+
+      socket
+        .to(mobileID)
+        .emit("progressUpdate", (result.position.x / 191) * 100);
+      socket.to(mobileID).emit("motionUpdate", {
+        acceleration: result.acceleration,
+        velocity: result?.velocity || { x: 0, y: 0, z: 0 },
+        position: result?.position || { x: 0, y: 0, z: 0 },
+        orientation: result?.orientation || { roll: 0, pitch: 0, yaw: 0 },
+        timeInterval: result?.timeStep || 0,
       });
     } else {
       socket.to(dashboardID).emit("acceleration", acc);
@@ -99,10 +157,12 @@ io.on("connection", (socket) => {
 
   // come to mobile and send to train
   socket.on("increaseBand", (band) => {
-    console.log("band", band);
+    passedBandCount = passedBandCount + 1;
+    socket.to(dashboardID).emit("band", passedBandCount);
   });
   socket.on("decreaseBand", (band) => {
-    console.log("band", band);
+    passedBandCount = passedBandCount - 1;
+    socket.to(dashboardID).emit("band", passedBandCount);
   });
   socket.on("brakeOpen", (isBrakeOpen) => {
     console.log("brakeOpen", isBrakeOpen);
