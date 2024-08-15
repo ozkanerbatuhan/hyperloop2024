@@ -1,25 +1,27 @@
 const express = require("express");
 const http = require("http");
 const socketIO = require("socket.io");
-const MotionCalculator = require("./gptdeeneme.js");
+const StableMotionCalculator = require("./class.js");
 const fs = require("fs");
 const path = require("path");
-const RaceTrack = require("./bandClass.js");
 const isRedColor = require("./isRed.js");
-
+const processSpeedCalculation = require("./speed.js");
+const TrainTunnel = require("./TrainTunnel.js");
+const StableSpeedCalculator = require("./StableSpeedCalculator.js");
+const trainTunnel = new TrainTunnel();
 let dashboardID = null;
 let trainID = null;
 let mobileID = null;
-
+const COOLDOWN_PERIOD = 2; // 2 ms cooldown period
+const speedCalculator = new StableSpeedCalculator();
 const app = express();
 const server = http.createServer(app);
-const raceTrack = new RaceTrack();
 const io = socketIO(server, {
   cors: {
     origin: "*",
   },
 });
-
+let prevTime = Date.now();
 const maxStrength = 12000;
 const minStrength = 5;
 const strengthThreshold = 1000;
@@ -30,7 +32,11 @@ let temperatures = {
 let passedBandCount = 0;
 let passedBandCountCoolDown = 0;
 const calculators = new Map();
-
+function sendPing(socket) {
+  setInterval(() => {
+    socket.to(trainID).emit("ping");
+  }, 500); // Send ping every 1 second
+}
 // Yardımcı fonksiyonlar
 const isValidId = (id) => typeof id === "string" && id.length > 0;
 const isValidNumber = (num) =>
@@ -71,13 +77,12 @@ io.on("connection", (socket) => {
       if (!isValidId(id)) {
         throw new Error("Invalid train ID");
       }
-      console.log("train", id);
       trainID = id;
-      if (dashboardID) {
-        socket.to(trainID).emit("ping", 1);
-      }
+      sendPing(socket);
+      socket.to(trainID).emit("ping");
+      console.log("train", trainID);
       if (!calculators.has(id)) {
-        calculators.set(id, new MotionCalculator());
+        calculators.set(id, new StableMotionCalculator());
       }
     } catch (error) {
       console.error("Error in train event:", error);
@@ -107,31 +112,64 @@ io.on("connection", (socket) => {
       console.error("Error in mobile event:", error);
     }
   });
-
+  socket.on("pong", () => {
+    let currentTime = Date.now();
+    let timeDiff = (currentTime - prevTime) / 1000;
+    socket.to(trainID).emit("ping");
+    console.log("pong", timeDiff.toFixed(3));
+    prevTime = currentTime;
+  });
   socket.on("band", (colorData) => {
     try {
       if (!isValidObject(colorData)) {
         throw new Error("Invalid color data");
       }
+
+      const currentTime = Date.now();
       const isRed = isRedColor(colorData);
-      if (isRed && Date.now() - passedBandCountCoolDown > 500) {
-        passedBandCount += 1;
-        passedBandCountCoolDown = Date.now();
-        const { position, speed, timeStep } =
-          raceTrack.calculatePositionAndSpeed(Date.now());
-        console.log("position", position, "speed", speed, "timeStep", timeStep);
+
+      if (isRed && currentTime - passedBandCountCoolDown > COOLDOWN_PERIOD) {
+        passedBandCountCoolDown = currentTime;
+
+        const { position, speed, timeSinceLastStripe, remainingDistance } =
+          trainTunnel.calculatePositionAndSpeed(currentTime);
+
+        console.log("Position:", position, "m");
+        console.log("Speed:", speed.toFixed(2), "m/s");
+        console.log(
+          "Time since last stripe:",
+          timeSinceLastStripe.toFixed(3),
+          "s"
+        );
+        console.log("Remaining distance:", remainingDistance, "m");
+
+        const currentSection = trainTunnel.getCurrentSection();
+        console.log("Current section:", currentSection);
 
         if (dashboardID) {
-          socket
-            .to(dashboardID)
-            .emit("positionUpdate", { passedBandCount, position, timeStep });
-          socket.to(dashboardID).emit("speedUpdate", { speed, timeStep });
+          socket.to(dashboardID).emit("positionUpdate", {
+            passedBandCount: trainTunnel.passedStripeCount,
+            position,
+            timeStep: timeSinceLastStripe,
+          });
+          socket.to(dashboardID).emit("speedUpdate", {
+            speed,
+            timeStep: timeSinceLastStripe,
+          });
+          socket.to(dashboardID).emit("position", position / 191);
         }
+
         if (mobileID) {
-          socket
-            .to(mobileID)
-            .emit("position", { passedBandCount, position, timeStep });
-          socket.to(mobileID).emit("speedUpdate", { speed, timeStep });
+          socket.to(mobileID).emit("position", {
+            passedBandCount: trainTunnel.passedStripeCount,
+            position,
+            timeStep: timeSinceLastStripe,
+          });
+
+          socket.to(mobileID).emit("speedUpdate", {
+            speed,
+            timeStep: timeSinceLastStripe,
+          });
         }
       }
     } catch (error) {
@@ -145,29 +183,91 @@ io.on("connection", (socket) => {
         console.log("Invalid lidar data received:", data);
         throw new Error("Invalid lidar data");
       }
-      temperatures.tempAmbient =
-        data.temp !== null ? data.temp : temperatures.tempAmbient;
-      if (dashboardID) {
-        socket.to(dashboardID).emit("temperatureUpdate", temperatures);
-      }
-      if (data.strength !== null && data.strength >= strengthThreshold) {
-        const remainingDistance =
-          ((data.strength - minStrength) / (maxStrength - minStrength)) * 40;
-        if (remainingDistance <= 40 && mobileID) {
-          socket.to(mobileID).emit("lidar", {
-            dis: data.dis,
-            strength: data.strength,
-            temp: data.temp,
-            time: data.time,
-          });
-        }
+
+      const maxDistance = 40; // Maximum viewing distance in meters
+      const minStrength = 4; // Minimum observed strength value
+      const maxStrength = 13000; // Maximum observed strength value
+
+      // Update ambient temperature if available
+      if (data.temp !== null) {
+        temperatures.tempAmbient = data.temp;
         if (dashboardID) {
-          socket.to(dashboardID).emit("lidarUpdate", {
-            dis: remainingDistance,
+          socket.to(dashboardID).emit("temperatureUpdate", temperatures);
+        }
+      }
+
+      // Function to calculate expected strength based on distance
+      const calculateExpectedStrength = (distance) => {
+        if (distance < 10) {
+          return maxStrength * Math.exp(-0.1 * distance);
+        } else if (distance < 50) {
+          return maxStrength * Math.exp(-0.1 * (distance - 10));
+        } else {
+          return Math.max(
+            minStrength,
+            maxStrength * Math.exp(-0.1 * (distance - 50))
+          );
+        }
+      };
+
+      // Function to check if the strength is within an acceptable range for the given distance
+      const isStrengthValid = (strength, distance) => {
+        const expectedStrength = calculateExpectedStrength(distance);
+        // console.log("Expected strength:", expectedStrength, strength);
+
+        const tolerance = 0.3; // 20% tolerance, adjust as needed
+        return strength >= expectedStrength * (1 - tolerance);
+      };
+
+      if (data.dis !== null && data.strength !== null) {
+        const distance = data.dis;
+        const normalizedStrength =
+          (data.strength - minStrength) / (maxStrength - minStrength);
+
+        if (isStrengthValid(data.strength, distance)) {
+          /*  console.log("Reliable LIDAR data received:", {
+            distance: distance,
             strength: data.strength,
+            normalizedStrength: normalizedStrength,
             temp: data.temp,
             time: data.time,
+          }); */
+          if (mobileID && distance <= maxDistance) {
+            socket.to(mobileID).emit("lidar", {
+              dis: distance,
+              strength: data.strength,
+              temp: data.temp,
+              time: data.time,
+            });
+          }
+          if (dashboardID) {
+            socket.to(dashboardID).emit("lidarUpdate", {
+              dis: distance,
+              strength: data.strength,
+              normalizedStrength: normalizedStrength,
+              temp: data.temp,
+              time: data.time,
+            });
+          }
+          const result = speedCalculator.processSpeedCalculation({
+            dis: distance,
           });
+          if (result) {
+            /* console.log(`Stable speed: ${result.filteredSpeed.toFixed(2)} m/s`); */
+            /* socket.to(mobileID).emit("speedUpdate", {
+              speed: result.filteredSpeed,
+              timeDiff: result.timeDiff,
+            });
+            socket
+              .to(dashboardID)
+              .emit("speedUpdate", { speed: result.filteredSpeed }); */
+          }
+        } else {
+          /* console.log("Unreliable LIDAR data:", {
+            distance: distance,
+            strength: data.strength,
+            expectedStrength: calculateExpectedStrength(distance),
+          }); */
         }
       }
     } catch (error) {
@@ -229,23 +329,9 @@ io.on("connection", (socket) => {
       console.error("Error in acceleration event:", error);
     }
   });
-  socket.on("ping", (time) => {
-    try {
-      console.log("ping", Date.now() - time);
-      if (dashboardID) socket.to(dashboardID).emit("ping", Date.now() - time);
-      if (mobileID) socket.to(mobileID).emit("ping", Date.now() - time);
-      if (trainID) socket.to(trainID).emit("ping", Date.now());
-    } catch (error) {
-      console.error("Error in ping event:", error);
-    }
-  });
 
-  // Diğer event handler'lar için benzer kontroller eklenebilir
   socket.on("disconnect", () => {
     console.log("A user disconnected");
-    if (socket.id === dashboardID) dashboardID = null;
-    if (socket.id === trainID) trainID = null;
-    if (socket.id === mobileID) mobileID = null;
   });
 
   socket.on("ready", (data) => {

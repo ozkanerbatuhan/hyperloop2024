@@ -1,172 +1,126 @@
-class MotionCalculator {
+class StableMotionCalculator {
   constructor() {
     this.velocity = { x: 0, y: 0, z: 0 };
     this.position = { x: 0, y: 0, z: 0 };
     this.orientation = { pitch: 0, yaw: 0, roll: 0 };
     this.lastUpdateTime = Date.now();
     this.gravity = 9.81;
-    this.alpha = 0.8; // Low-pass filter coefficient
-    this.gyroError = { x: 0.56, y: -2, z: 0.79 }; // From Arduino code
-    this.accError = { x: 0.58, y: -1.58 }; // From Arduino code
-    this.lastGyro = { x: 0, y: 0, z: 0 };
-    this.gyroAngle = { x: 0, y: 0 };
-    this.initialized = false;
-    this.stationaryThreshold = 0.015;
+
+    // Kalman filter parameters
+    this.kalmanState = {
+      x: 0,
+      y: 0,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      ax: 0,
+      ay: 0,
+      az: 0
+    };
+    this.kalmanCovariance = Array(9).fill().map(() => Array(9).fill(0));
+    this.processNoise = 0.01;
+    this.measurementNoise = 0.1;
   }
 
   update(acceleration, gyro) {
     const currentTime = Date.now();
     const elapsedTime = (currentTime - this.lastUpdateTime) / 1000; // Time in seconds
 
-    if (!this.initialized) {
-      this.initializeStationary(acceleration, gyro);
-      this.initialized = true;
-      return this.getCurrentState();
-    }
+    // Remove gravity from acceleration
+    const accWithoutGravity = this.removeGravity(acceleration);
 
-    // Convert acceleration to g force (assuming it's in m/s^2)
-    const accInG = {
-      x: acceleration.x / this.gravity,
-      y: acceleration.y / this.gravity,
-      z: acceleration.z / this.gravity,
+    // Apply Kalman filter
+    this.kalmanFilter(accWithoutGravity, elapsedTime);
+
+    // Update orientation using complementary filter
+    this.updateOrientation(acceleration, gyro, elapsedTime);
+
+    // Update velocity and position from Kalman filter state
+    this.velocity = {
+      x: this.kalmanState.vx,
+      y: this.kalmanState.vy,
+      z: this.kalmanState.vz
     };
-
-    // Calculate accelerometer angles
-    const accAngleX =
-      (Math.atan(
-        accInG.y / Math.sqrt(Math.pow(accInG.x, 2) + Math.pow(accInG.z, 2))
-      ) *
-        180) /
-        Math.PI -
-      this.accError.x;
-    const accAngleY =
-      (Math.atan(
-        (-1 * accInG.x) /
-          Math.sqrt(Math.pow(accInG.y, 2) + Math.pow(accInG.z, 2))
-      ) *
-        180) /
-        Math.PI +
-      this.accError.y;
-
-    // Correct gyro values
-    const correctedGyro = {
-      x: gyro.x + this.gyroError.x,
-      y: gyro.y + this.gyroError.y,
-      z: gyro.z + this.gyroError.z,
+    this.position = {
+      x: this.kalmanState.x,
+      y: this.kalmanState.y,
+      z: this.kalmanState.z
     };
-
-    // Calculate gyro angles
-    this.gyroAngle.x += correctedGyro.x * elapsedTime;
-    this.gyroAngle.y += correctedGyro.y * elapsedTime;
-    this.orientation.yaw += correctedGyro.z * elapsedTime;
-
-    // Complementary filter
-    this.orientation.roll = 0.96 * this.gyroAngle.x + 0.04 * accAngleX;
-    this.orientation.pitch = 0.96 * this.gyroAngle.y + 0.04 * accAngleY;
-
-    // Normalize angles
-    this.orientation.roll = this.normalizeAngle(this.orientation.roll);
-    this.orientation.pitch = this.normalizeAngle(this.orientation.pitch);
-    this.orientation.yaw = this.normalizeAngle(this.orientation.yaw);
-
-    // Update velocity and position (simplified from original)
-    const filteredAcc = this.lowPassFilter(this.removeGravity(acceleration));
-
-    if (Math.abs(filteredAcc.x) > this.stationaryThreshold) {
-      this.velocity.x += filteredAcc.x * elapsedTime;
-    } else {
-      this.velocity.x = 0;
-    }
-
-    if (Math.abs(filteredAcc.y) > this.stationaryThreshold) {
-      this.velocity.y += filteredAcc.y * elapsedTime;
-    } else {
-      this.velocity.y = 0;
-    }
-
-    if (Math.abs(filteredAcc.z) > this.stationaryThreshold) {
-      this.velocity.z += filteredAcc.z * elapsedTime;
-    } else {
-      this.velocity.z = 0;
-    }
-
-    const dampingFactor = 0.9;
-    this.velocity.x *= dampingFactor;
-    this.velocity.y *= dampingFactor;
-    this.velocity.z *= dampingFactor;
-
-    this.position.x += this.velocity.x * elapsedTime;
-    this.position.y += this.velocity.y * elapsedTime;
-    this.position.z += this.velocity.z * elapsedTime;
 
     this.lastUpdateTime = currentTime;
-    this.lastGyro = gyro;
 
     return this.getCurrentState(elapsedTime);
   }
 
-  initializeStationary(acceleration, gyro) {
-    this.filteredAcc = { x: 0, y: 0, z: 0 };
-    this.lastGyro = gyro;
-  }
-
   removeGravity(acceleration) {
+    // Simple gravity removal assuming the device is roughly level
     return {
-      x: acceleration.x - this.gravity,
+      x: acceleration.x,
       y: acceleration.y,
-      z: acceleration.z,
+      z: acceleration.z - this.gravity
     };
   }
 
-  lowPassFilter(acceleration) {
-    this.filteredAcc.x =
-      this.alpha * this.filteredAcc.x + (1 - this.alpha) * acceleration.x;
-    this.filteredAcc.y =
-      this.alpha * this.filteredAcc.y + (1 - this.alpha) * acceleration.y;
-    this.filteredAcc.z =
-      this.alpha * this.filteredAcc.z + (1 - this.alpha) * acceleration.z;
-    return this.filteredAcc;
-  }
+  kalmanFilter(acceleration, dt) {
+    // Prediction step
+    const F = [
+      [1, 0, 0, dt, 0, 0, 0.5*dt*dt, 0, 0],
+      [0, 1, 0, 0, dt, 0, 0, 0.5*dt*dt, 0],
+      [0, 0, 1, 0, 0, dt, 0, 0, 0.5*dt*dt],
+      [0, 0, 0, 1, 0, 0, dt, 0, 0],
+      [0, 0, 0, 0, 1, 0, 0, dt, 0],
+      [0, 0, 0, 0, 0, 1, 0, 0, dt],
+      [0, 0, 0, 0, 0, 0, 1, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 1, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 1]
+    ];
 
-  correctGyro(gyro) {
-    const gyroDiff = {
-      x: gyro.x - this.lastGyro.x,
-      y: gyro.y - this.lastGyro.y,
-      z: gyro.z - this.lastGyro.z,
-    };
-
-    const errorWeight = 0.95;
-    this.gyroError.x =
-      errorWeight * this.gyroError.x + (1 - errorWeight) * gyroDiff.x;
-    this.gyroError.y =
-      errorWeight * this.gyroError.y + (1 - errorWeight) * gyroDiff.y;
-    this.gyroError.z =
-      errorWeight * this.gyroError.z + (1 - errorWeight) * gyroDiff.z;
-
-    return {
-      x: gyro.x - this.gyroError.x,
-      y: gyro.y - this.gyroError.y,
-      z: gyro.z - this.gyroError.z,
-    };
-  }
-
-  updateOrientation(acceleration, gyro, timeStep) {
-    const accelPitch = Math.atan2(
-      -acceleration.x,
-      Math.sqrt(
-        acceleration.y * acceleration.y + acceleration.z * acceleration.z
-      )
+    const predictedState = this.matrixMultiply(F, Object.values(this.kalmanState));
+    const Q = this.createDiagonalMatrix(9, this.processNoise);
+    const predictedCovariance = this.matrixAdd(
+      this.matrixMultiply(this.matrixMultiply(F, this.kalmanCovariance), this.transposeMatrix(F)),
+      Q
     );
+
+    // Update step
+    const H = [
+      [0, 0, 0, 0, 0, 0, 1, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 1, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0, 1]
+    ];
+    const R = this.createDiagonalMatrix(3, this.measurementNoise);
+    const y = [acceleration.x - predictedState[6], acceleration.y - predictedState[7], acceleration.z - predictedState[8]];
+    const S = this.matrixAdd(
+      this.matrixMultiply(this.matrixMultiply(H, predictedCovariance), this.transposeMatrix(H)),
+      R
+    );
+    const K = this.matrixMultiply(this.matrixMultiply(predictedCovariance, this.transposeMatrix(H)), this.inverseMatrix(S));
+
+    const updatedState = this.vectorAdd(predictedState, this.matrixMultiply(K, y));
+    const updatedCovariance = this.matrixSubtract(
+      predictedCovariance,
+      this.matrixMultiply(this.matrixMultiply(K, H), predictedCovariance)
+    );
+
+    // Update Kalman filter state and covariance
+    this.kalmanState = {
+      x: updatedState[0], y: updatedState[1], z: updatedState[2],
+      vx: updatedState[3], vy: updatedState[4], vz: updatedState[5],
+      ax: updatedState[6], ay: updatedState[7], az: updatedState[8]
+    };
+    this.kalmanCovariance = updatedCovariance;
+  }
+
+  updateOrientation(acceleration, gyro, dt) {
+    // Complementary filter for orientation
+    const accelPitch = Math.atan2(-acceleration.x, Math.sqrt(acceleration.y * acceleration.y + acceleration.z * acceleration.z));
     const accelRoll = Math.atan2(acceleration.y, acceleration.z);
 
-    const gyroWeight = 0.95;
-    this.orientation.pitch =
-      gyroWeight * (this.orientation.pitch + gyro.x * timeStep) +
-      (1 - gyroWeight) * ((accelPitch * 180) / Math.PI);
-    this.orientation.roll =
-      gyroWeight * (this.orientation.roll + gyro.y * timeStep) +
-      (1 - gyroWeight) * ((accelRoll * 180) / Math.PI);
-    this.orientation.yaw += gyro.z * timeStep;
+    const alpha = 0.98;
+    this.orientation.pitch = alpha * (this.orientation.pitch + gyro.x * dt) + (1 - alpha) * accelPitch;
+    this.orientation.roll = alpha * (this.orientation.roll + gyro.y * dt) + (1 - alpha) * accelRoll;
+    this.orientation.yaw += gyro.z * dt;
 
     this.orientation.pitch = this.normalizeAngle(this.orientation.pitch);
     this.orientation.roll = this.normalizeAngle(this.orientation.roll);
@@ -174,8 +128,8 @@ class MotionCalculator {
   }
 
   normalizeAngle(angle) {
-    while (angle > 180) angle -= 360;
-    while (angle < -180) angle += 360;
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
     return angle;
   }
 
@@ -184,10 +138,55 @@ class MotionCalculator {
       velocity: { ...this.velocity },
       position: { ...this.position },
       orientation: { ...this.orientation },
-      acceleration: { ...this.filteredAcc },
-      timeStep: timeStep,
+      acceleration: {
+        x: this.kalmanState.ax,
+        y: this.kalmanState.ay,
+        z: this.kalmanState.az
+      },
+      timeStep: timeStep
     };
+  }
+
+  // Matrix operation helper functions
+  matrixMultiply(a, b) {
+    if (typeof b[0] !== 'object') {
+      return a.map(row => row.reduce((sum, val, i) => sum + val * b[i], 0));
+    }
+    return a.map(row => b[0].map((_, i) => row.reduce((sum, val, j) => sum + val * b[j][i], 0)));
+  }
+
+  matrixAdd(a, b) {
+    return a.map((row, i) => row.map((val, j) => val + b[i][j]));
+  }
+
+  matrixSubtract(a, b) {
+    return a.map((row, i) => row.map((val, j) => val - b[i][j]));
+  }
+
+  transposeMatrix(m) {
+    return m[0].map((_, i) => m.map(row => row[i]));
+  }
+
+  createDiagonalMatrix(size, value) {
+    return Array(size).fill().map((_, i) => Array(size).fill().map((_, j) => i === j ? value : 0));
+  }
+
+  inverseMatrix(m) {
+    // Simple 3x3 matrix inversion, for larger matrices use a more robust method
+    const det = m[0][0] * (m[1][1] * m[2][2] - m[2][1] * m[1][2]) -
+                m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const invdet = 1 / det;
+    return [
+      [(m[1][1] * m[2][2] - m[2][1] * m[1][2]) * invdet, (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * invdet, (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * invdet],
+      [(m[1][2] * m[2][0] - m[1][0] * m[2][2]) * invdet, (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * invdet, (m[1][0] * m[0][2] - m[0][0] * m[1][2]) * invdet],
+      [(m[1][0] * m[2][1] - m[2][0] * m[1][1]) * invdet, (m[2][0] * m[0][1] - m[0][0] * m[2][1]) * invdet, (m[0][0] * m[1][1] - m[1][0] * m[0][1]) * invdet]
+    ];
+  }
+
+  vectorAdd(a, b) {
+    return a.map((val, i) => val + b[i]);
   }
 }
 
-module.exports = MotionCalculator;
+module.exports = StableMotionCalculator;
